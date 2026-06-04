@@ -1,0 +1,15 @@
+venv
+data
+__pycache__
+desktop.ini
+
+
+
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+frontend/coverage/
+frontend/.DS_Store
+frontend/*.log
+frontend/.env*
+frontend/!.env.example

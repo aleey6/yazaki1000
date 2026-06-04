@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+
+aside {
+  z-index: 50;
+  position: sticky;
+}
+
+main {
+  position: relative;
+  z-index: 1;
+}

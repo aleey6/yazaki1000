@@ -1,0 +1,6 @@
+{
+  "name": "YAZAKI IAM Invoice Extractor",
+  "description": "React-based budget tracking, configuration, billing analytics, and invoice processing system for YAZAKI plant IAM telecom bills.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
