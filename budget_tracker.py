@@ -211,18 +211,18 @@ class BudgetTracker:
 
         with get_conn() as conn:
             # ── Duplicate check ───────────────────────────────────────────
-            #dup = conn.execute(
-            #    """
-            #    SELECT COUNT(*) FROM budget_transactions
-            #    WHERE invoice_number = ? AND department_id IN (
-            #        SELECT id FROM departments WHERE plant_name = ?
-            #    )
-            #    """,
-            #    (invoice_number, plant),
-            #).fetchone()
+            dup = conn.execute(
+               """
+               SELECT COUNT(*) FROM budget_transactions
+               WHERE invoice_number = ? AND department_id IN (
+                   SELECT id FROM departments WHERE plant_name = ?
+               )
+                """,
+               (invoice_number, plant),
+            ).fetchone()
 
-            #if dup[0] > 0:
-            #    raise DuplicateInvoiceError(invoice_number)
+            if dup[0] > 0:
+               raise DuplicateInvoiceError(invoice_number)
 
             # ── Process each PDF page / contract ─────────────────────────
             now = datetime.now().isoformat(timespec="seconds")
