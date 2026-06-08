@@ -32,12 +32,16 @@ RE_INVOICE_NUMBER = re.compile(
     re.IGNORECASE
 )
 
-_RE_CLIENT_LABEL = r"(?:N[°o©0O]?\s*[-.]?\s*Client|N[°o©0O]?\s*d['\u2019]?Abonnement|Abonnement)"
+_RE_CLIENT_LABEL = r"(?:N[°o©0O]?\s*[-.]?\s*Client|N[°o©0O]?\s*d['\u2019]?Abonnement|Abonnement|Client\s+N[°o©0O]?)"
+
 RE_CLIENT_NUMBER = re.compile(
-    r"(?:" + _RE_CLIENT_LABEL + r")\s*:?\s*(\d+\.\d+\.\d+\.\d+\.\d+)"
-    r"|(\d+\.\d+\.\d+\.\d+\.\d+)",
+    r"(?:" + _RE_CLIENT_LABEL + r")\s*:?\s*([0-9\.\s]+)"
+    r"|([0-9\.\s]{15,30})",
     re.IGNORECASE
 )
+
+# Pattern exact pour le numéro client complet
+EXACT_CLIENT_PATTERN = re.compile(r'(\d{1}\.\d{6}\.\d{2}\.\d{2}\.\d{6})')
 
 RE_INVOICE_DATE = re.compile(
     r"Date\s*[Ff]acture\s*[©:]?\s*(\d{2}[/\-]\d{2}[/\-]\d{4})"
@@ -61,6 +65,24 @@ RE_TOTAL_CONTRAT = re.compile(
 RE_PERIOD = re.compile(
     r"P[ée]riode\s+factur[ée]e\s*:?\s*(\d{2}[/\-]\d{2}[/\-]\d{4})\s*[-à]\s*(\d{2}[/\-]\d{2}[/\-]\d{4})"
     r"|P[ée]riode[^0-9]*(\d{2}/\d{2}/\d{4})[^0-9]*(\d{2}/\d{2}/\d{4})",
+    re.IGNORECASE
+)
+
+# Pattern spécifique pour la période au format "Date début : 01/03/2026 Date Fin : 31/03/2026"
+PERIOD_PATTERN = re.compile(
+    r"Date\s+d[ée]but\s*:\s*(\d{2}/\d{2}/\d{4})\s*Date\s+Fin\s*:\s*(\d{2}/\d{2}/\d{4})",
+    re.IGNORECASE
+)
+
+# Pattern spécifique pour la date facture
+DATE_PATTERN = re.compile(
+    r"Date\s+Facture\s*:\s*(\d{2}/\d{2}/\d{4})",
+    re.IGNORECASE
+)
+
+# Pattern spécifique pour le numéro d'appel
+PHONE_PATTERN = re.compile(
+    r"N°\s*d['\u2019]?\s*Appel\s*:\s*(0[5-7][\d\s]{8,12})",
     re.IGNORECASE
 )
 
@@ -94,6 +116,7 @@ class Contract:
     document_page: Optional[str] = None
     contract_type: str = ""
     phone_number: Optional[str] = None
+    invoice_date: Optional[str] = None 
     period_start: Optional[str] = None
     period_end: Optional[str] = None
     articles_mensuels: int = 0
@@ -146,28 +169,23 @@ def _ocr_fitz_page(fitz_doc: fitz.Document, page_idx: int, ocr_engine, dpi: int 
 
 # ──────────────────────────── Page-type helpers ───────────────────────────────
 
-# REPLACE the entire function:
 def _identify_page_kind(text: str) -> Tuple[str, Optional[str]]:
-    # Normalize whitespace for fuzzy matching (OCR often adds/removes spaces)
     t = re.sub(r"\s+", " ", text)
 
-    if re.search(r"Forfait\s*Optimi[sz]", t, re.IGNORECASE):
-        return "contract", "Forfait Optimis"
-    if re.search(r"Illimit[ée]\s*Mobile\s*Plafonn[ée]", t, re.IGNORECASE):
-        return "contract", "Illimite Mobile Plafonne"
-    if re.search(r"Illimit[ée]\s*Mobile", t, re.IGNORECASE):
-        return "contract", "Illimite Mobile"
-    # Match TOTAL CONTRAT with flexible spacing (OCR often splits tokens)
-    if re.search(r"TOTAL\s*CONTRAT", t, re.IGNORECASE):
+    # Détection page contrat - priorité absolue
+    if re.search(r"N°\s*d['\u2019]?\s*Appel", t, re.IGNORECASE):
         return "contract", "Contrat"
-    # OCR signal: page has "Appel" label AND a Moroccan phone number → it's a contract page
-    flat = re.sub(r"\s", "", t)
-    if re.search(r"[Aa]ppel", t) and re.search(r"0[5-7]\d{8}", flat):
+    if re.search(r"Forfait\s*Optimi[sz]|Illimit[ée]\s*Mobile", t, re.IGNORECASE):
+        return "contract", "Forfait"
+    if re.search(r"TOTAL\s+CONTRAT", t, re.IGNORECASE):
         return "contract", "Contrat"
+    if re.search(r"FRAIS\s+(MENSUELS|PONCTUELS)", t, re.IGNORECASE):
+        return "contract", "Contrat"
+    
+    # Détection page globale
     if re.search(r"Page\s*globale|R[ée]capitulatif", t, re.IGNORECASE):
         return "global", None
-    # Broader fallback: page with Montant TTC is a global summary
-    if re.search(r"Montant\s*TTC", t, re.IGNORECASE):
+    if re.search(r"Montant\s*TTC", t, re.IGNORECASE) and re.search(r"YAZAKI", t, re.IGNORECASE):
         return "global", None
 
     return "unknown", None
@@ -181,10 +199,8 @@ def _document_page(text: str) -> Optional[str]:
 def _extract_phone_ocr(text: str) -> Optional[str]:
     """
     Phone extractor specifically for OCR text where layout is unpredictable.
-    OCR may split 'N° d'Appel' across lines or mangle the degree symbol.
-    Four strategies tried in order.
     """
-    # Strategy 1: label + number on same line (best-case OCR)
+    # Strategy 1: label + number on same line
     m = re.search(
         r"[Nn]\s*[°©o0]?\s*\.?\s*d['\u2019\s]?\s*[Aa]ppel[^0-9]{0,30}"
         r"(0[5-7]\d[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})",
@@ -203,20 +219,11 @@ def _extract_phone_ocr(text: str) -> Optional[str]:
                 if m2:
                     return m2.group(1)
 
-    # Strategy 3: strip ALL whitespace/newlines then find "appel" near a number
+    # Strategy 3: strip ALL whitespace
     flat = re.sub(r"[\s\n]", "", text)
-    m = re.search(
-        r"[Aa]ppel.{0,10}(0[5-7]\d{8})",
-        flat, re.IGNORECASE
-    )
+    m = re.search(r"[Aa]ppel.{0,10}(0[5-7]\d{8})", flat, re.IGNORECASE)
     if m:
         return m.group(1)
-
-    # Strategy 4: any line that IS a standalone 10-digit Moroccan mobile number
-    for line in lines:
-        clean = re.sub(r"[\s\-\.]", "", line.strip())
-        if re.match(r"^(0[5-7]\d{8})$", clean):
-            return clean
 
     return None
 
@@ -225,12 +232,10 @@ def _extract_phone_direct(text: str) -> Optional[str]:
     """
     Phone extractor for direct pdfplumber text.
     """
-    # Primary: use compiled RE_PHONE
     m = RE_PHONE.search(text)
     if m:
         return re.sub(r"[\s\-]", "", m.group(1))
 
-    # Fallback 1: label with any encoding + nearby number on space-stripped text
     m = re.search(
         r"[Nn][°©o0]?\s*\.?\s*d['\u2019\s]?\s*[Aa]ppel[^0-9]{0,20}(0[5-7]\d{8})",
         text.replace(" ", ""),
@@ -239,14 +244,8 @@ def _extract_phone_direct(text: str) -> Optional[str]:
     if m:
         return m.group(1)
 
-    # Fallback 2: standalone 10-digit number per line
-    for line in text.split('\n'):
-        clean = re.sub(r"[\s\-]", "", line)
-        m = re.search(r"(?<!\d)(0[5-7]\d{8})(?!\d)", clean)
-        if m:
-            return m.group(1)
-
     return None
+
 
 # ──────────────────────────── Page parsers ───────────────────────────────────
 
@@ -283,77 +282,93 @@ def _parse_contract_page(text: str, page_no: int, contract_type: str) -> Contrac
         contract_type=contract_type,
     )
 
-    # Phone number
-   # Phone number — 3-layer fallback
-   # BEFORE (your current code):
-    # Phone number
-   # Phone number — 3-layer fallback
-    m_phone = RE_PHONE.search(text)
-    if m_phone:
-        raw = m_phone.group(1)
-        contract.phone_number = re.sub(r"[\s\-]", "", raw)
+    # ==================== DEBUG: Afficher le texte OCR ====================
+    print(f"\n   🔍 === OCR PAGE {page_no} (lignes clés) ===")
+    for line in text.split('\n'):
+        line_lower = line.lower()
+        if any(keyword in line_lower for keyword in ['appel', 'date', 'période', 'facture', 'client', 'contrat']):
+            print(f"      {line[:150]}")
+    print(f"   🔍 ========================================\n")
 
+    # ==================== 1. PHONE NUMBER ====================
+    phone_match = re.search(r"N°\s*d['\u2019]?\s*Appel\s*:\s*(0[5-7][\d\s]{8,12})", text, re.IGNORECASE)
+    if phone_match:
+        contract.phone_number = re.sub(r'[\s\-]', '', phone_match.group(1))
+        print(f"   📞 Phone (pattern1): {contract.phone_number}")
+    
     if not contract.phone_number:
-        # Layer 2: search for the label with any encoding, then grab the next 10-digit number
-        m = re.search(
-            r"[Nn]\s*[°©o0]?\s*\.?\s*d['\u2019\s]?\s*[Aa]ppel[^0-9]{0,20}(0[5-7]\d{8})",
-            text.replace(" ", ""),
-            re.IGNORECASE
-        )
-        if m:
-            contract.phone_number = m.group(1)
-
+        phone_match = re.search(r"N°\s+d['\u2019]?\s*Appel\s*:?\s*(0[5-7][\d\s]{8,12})", text, re.IGNORECASE)
+        if phone_match:
+            contract.phone_number = re.sub(r'[\s\-]', '', phone_match.group(1))
+            print(f"   📞 Phone (pattern2): {contract.phone_number}")
+    
     if not contract.phone_number:
-        # Layer 3: scan every line for a standalone 10-digit Moroccan mobile number
         for line in text.split('\n'):
-            line_clean = re.sub(r"[\s\-]", "", line)
-            m = re.search(r"(?<!\d)(0[5-7]\d{8})(?!\d)", line_clean)
-            if m:
-                contract.phone_number = m.group(1)
-                break
+            if 'Appel' in line:
+                nums = re.findall(r'0[5-7][\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2}', line)
+                if nums:
+                    contract.phone_number = re.sub(r'[\s\-]', '', nums[0])
+                    print(f"   📞 Phone (line): {contract.phone_number}")
+                    break
 
-# AFTER — route to the right extractor based on OCR heuristic:
-    # Phone number — route to OCR-aware or direct extractor
-    # Heuristic: OCR text has many very short lines (character-level splits)
-    short_lines = sum(1 for l in text.split('\n') if 0 < len(l.strip()) < 5)
-    is_ocr_text = short_lines > 4
+    # ==================== 2. DATE FACTURE & PERIOD ====================
+    # ⚠️ CE BLOC DOIT ÊTRE ICI, PAS À L'INTÉRIEUR D'UN AUTRE BLOC
+    lines = text.split('\n')
+    
+    for line in lines:
+        line_lower = line.lower()
+        
+        # Date Facture
+        if 'date facture' in line_lower:
+            match = re.search(r'(\d{2}/\d{2}/\d{4})', line)
+            if match:
+                contract.invoice_date = match.group(1)
+                print(f"   📅 Date Facture: {contract.invoice_date}")
+        
+        # Début Période
+        if ('début' in line_lower or 'debut' in line_lower) and not contract.period_start:
+            match = re.search(r'(\d{2}/\d{2}/\d{4})', line)
+            if match:
+                contract.period_start = match.group(1)
+                print(f"   📅 Period start: {contract.period_start}")
+        
+        # Fin Période
+        if 'fin' in line_lower and not contract.period_end:
+            match = re.search(r'(\d{2}/\d{2}/\d{4})', line)
+            if match:
+                contract.period_end = match.group(1)
+                print(f"   📅 Period end: {contract.period_end}")
 
-    if is_ocr_text:
-        contract.phone_number = _extract_phone_ocr(text)
-    else:
-        contract.phone_number = _extract_phone_direct(text)
+    # Fallback: chercher "Période facturée"
+    if not contract.period_start or not contract.period_end:
+        period_match = re.search(r"P[ée]riode\s+factur[ée]e\s*:?\s*(\d{2}/\d{2}/\d{4})\s*[-à]\s*(\d{2}/\d{2}/\d{4})", text, re.IGNORECASE)
+        if period_match:
+            contract.period_start = period_match.group(1)
+            contract.period_end = period_match.group(2)
+            print(f"   📅 Period (fallback): {contract.period_start} → {contract.period_end}")
 
-    # Universal last-resort: search the entire text stripped of all whitespace
-    if not contract.phone_number:
-        flat = re.sub(r"[\s\-]", "", text)
-        m = re.search(r"(?<!\d)(0[5-7]\d{8})(?!\d)", flat)
-        if m:
-            contract.phone_number = m.group(1)
-    # Period
-    m_period = RE_PERIOD.search(text)
-    if m_period:
-        contract.period_start = m_period.group(1)
-        contract.period_end   = m_period.group(2)
-    else:
-        dates = re.findall(r"(\d{2}/\d{2}/\d{4})", text)
-        if len(dates) >= 2:
-            contract.period_start, contract.period_end = dates[0], dates[1]
-
-    # Total
+    # ==================== 3. TOTAL ====================
     m_total = RE_TOTAL_CONTRAT.search(text)
     if m_total:
         contract.total_contrat = _to_float(m_total.group(1))
+        print(f"   💰 Total: {contract.total_contrat}")
 
-    # Line items
+    # ==================== 4. LINE ITEMS ====================
     section = None
     for line in text.split('\n'):
         line = line.strip()
         if not line:
             continue
         lu = line.upper()
-        if 'FRAIS MENSUELS'  in lu: section = "mensuel";  continue
-        if 'FRAIS PONCTUELS' in lu: section = "ponctuel"; continue
-        if 'TOTAL CONTRAT'   in lu: section = None;       continue
+        if 'FRAIS MENSUELS' in lu:
+            section = "mensuel"
+            continue
+        if 'FRAIS PONCTUELS' in lu:
+            section = "ponctuel"
+            continue
+        if 'TOTAL CONTRAT' in lu:
+            section = None
+            continue
 
         if section == "mensuel":
             m = RE_TABLE_ROW.match(line)
@@ -392,9 +407,6 @@ def parse_invoice(
     OCR behavior:
       - If ocr_engine is None: use direct pdfplumber extraction only (no OCR)
       - If ocr_engine is provided: use OCR for EVERY page (forced OCR mode)
-    
-    No automatic detection - OCR is either all or nothing based on whether
-    an engine is passed to the function.
     """
     source_label = str(pdf_source) if isinstance(pdf_source, (str, Path)) else "<uploaded>"
     invoice = InvoiceData(source_file=source_label)
@@ -415,7 +427,6 @@ def parse_invoice(
 
     # Open with fitz for OCR rendering (if needed)
     fitz_doc = fitz.open(stream=pdf_bytes, filetype="pdf") if use_ocr else None
-    total_pages = len(fitz_doc) if fitz_doc else 0
 
     # Open with pdfplumber for normal extraction
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -427,47 +438,71 @@ def parse_invoice(
             if progress_callback:
                 progress_callback(page_no, total_pages, f"Page {page_no}/{total_pages}...")
 
-            # Decide extraction method based on ocr_engine parameter
+            # Decide extraction method
             if use_ocr and fitz_doc:
-                # OCR MODE: Use OCR for every page
                 text = _ocr_fitz_page(fitz_doc, idx, ocr_engine)
                 extraction_method = "OCR (forced)"
                 if not text or len(text.strip()) < 10:
                     print(f"   Page {page_no}: OCR minimal output, skipping")
                     continue
             else:
-                # DIRECT MODE: Use pdfplumber normal extraction
                 text = pdf.pages[idx].extract_text() or ""
                 extraction_method = "direct pdfplumber"
                 if not text.strip():
                     print(f"   Page {page_no}: no text found, skipping")
                     continue
 
-            # Extract global invoice header fields (first occurrence wins)
+            # ==================== EXTRACT INVOICE NUMBER ====================
             if invoice.invoice_number is None:
                 m = RE_INVOICE_NUMBER.search(text)
                 if m:
                     invoice.invoice_number = (m.group(1) or m.group(2) or "").strip()
                     print(f"   -> Invoice#: {invoice.invoice_number}")
 
+            # ==================== EXTRACT CLIENT NUMBER ====================
             if invoice.client_number is None:
-                m = RE_CLIENT_NUMBER.search(text)
+                # Essayer d'abord avec le pattern exact
+                m = EXACT_CLIENT_PATTERN.search(text)
                 if m:
-                    invoice.client_number = (m.group(1) or m.group(2) or "").strip()
-                    print(f"   -> Client#: {invoice.client_number}")
+                    invoice.client_number = m.group(1)
+                    print(f"   -> Client# (exact): {invoice.client_number}")
+                else:
+                    m = RE_CLIENT_NUMBER.search(text)
+                    if m:
+                        raw_client = (m.group(1) or m.group(2) or "").strip()
+                        raw_client = re.sub(r'\s+', '', raw_client)
+                        # Enlever le '2' final si présent
+                        raw_client = re.sub(r'2$', '', raw_client)
+                        invoice.client_number = raw_client
+                        print(f"   -> Client#: {invoice.client_number}")
 
+            # ==================== EXTRACT INVOICE DATE ====================
             if invoice.invoice_date is None:
-                m = RE_INVOICE_DATE.search(text)
+                m = DATE_PATTERN.search(text)
                 if m:
-                    invoice.invoice_date = (m.group(1) or m.group(2) or "").strip()
+                    invoice.invoice_date = m.group(1)
+                    print(f"   -> Date Facture: {invoice.invoice_date}")
+                else:
+                    m = RE_INVOICE_DATE.search(text)
+                    if m:
+                        invoice.invoice_date = (m.group(1) or m.group(2) or "").strip()
+                        print(f"   -> Date Facture (fallback): {invoice.invoice_date}")
 
+            # ==================== EXTRACT PERIOD ====================
             if invoice.period_start is None:
-                m = RE_PERIOD.search(text)
+                m = PERIOD_PATTERN.search(text)
                 if m:
-                    invoice.period_start = m.group(1) or m.group(3) or ""
-                    invoice.period_end   = m.group(2) or m.group(4) or ""
+                    invoice.period_start = m.group(1)
+                    invoice.period_end = m.group(2)
+                    print(f"   -> Period: {invoice.period_start} → {invoice.period_end}")
+                else:
+                    m = RE_PERIOD.search(text)
+                    if m:
+                        invoice.period_start = m.group(1) or m.group(3) or ""
+                        invoice.period_end = m.group(2) or m.group(4) or ""
+                        print(f"   -> Period (fallback): {invoice.period_start} → {invoice.period_end}")
 
-            # Classify page and parse
+            # ==================== CLASSIFY AND PARSE PAGE ====================
             kind, contract_type = _identify_page_kind(text)
 
             if kind == "global":
@@ -477,6 +512,29 @@ def parse_invoice(
 
             elif kind == "contract":
                 contract = _parse_contract_page(text, page_no, contract_type or "Contrat")
+                
+                # ==================== TRANSFERT DES DONNEES VERS L'INVOICE ====================
+                # Transférer la date facture du contrat vers l'invoice
+                if hasattr(contract, 'invoice_date') and contract.invoice_date:
+                    if invoice.invoice_date is None:
+                        invoice.invoice_date = contract.invoice_date
+                        print(f"   -> Date Facture (transférée): {invoice.invoice_date}")
+                    elif invoice.invoice_date != contract.invoice_date:
+                        print(f"   -> Date Facture: {invoice.invoice_date} (déjà définie)")
+                
+                # Transférer la période du contrat vers l'invoice
+                if contract.period_start and contract.period_end:
+                    if invoice.period_start is None:
+                        invoice.period_start = contract.period_start
+                        invoice.period_end = contract.period_end
+                        print(f"   -> Period (transférée): {invoice.period_start} → {invoice.period_end}")
+                    elif invoice.period_start != contract.period_start:
+                        print(f"   -> Period: {invoice.period_start} → {invoice.period_end} (déjà définie)")
+                
+                # Transférer le numéro de téléphone si nécessaire
+                if contract.phone_number:
+                    print(f"   -> Phone (dans contrat): {contract.phone_number}")
+                
                 if contract.total_contrat > 0 or contract.phone_number:
                     invoice.contracts.append(contract)
                     phone_str = f" Phone: {contract.phone_number}" if contract.phone_number else ""
@@ -484,10 +542,6 @@ def parse_invoice(
                     print(f"   OK Page {page_no}: contract [{extraction_method}]{phone_str}{total_str}")
                 else:
                     print(f"   - Page {page_no}: contract page skipped (no phone/total)")
-
-            else:
-                print(f"   - Page {page_no}: unclassified, skipped")
-
     # Clean up
     if fitz_doc:
         fitz_doc.close()
@@ -510,7 +564,7 @@ def parse_invoice(
     if invoice.contracts:
         unique_phones = {c.phone_number for c in invoice.contracts if c.phone_number}
         print(f"   Unique phones: {len(unique_phones)}")
-    print(f"   Invoice: {invoice.invoice_number}  Client: {invoice.client_number}")
+    print(f"   Invoice: {invoice.invoice_number}  Client: {invoice.client_number}  Date: {invoice.invoice_date}")
 
     if progress_callback:
         progress_callback(total_pages, total_pages, "Termine!")

@@ -142,54 +142,100 @@ export default function App() {
   };
 
   // Primary bootstrapper fetching all live backend details
-  const fetchAllData = async () => {
-    setLoading(true);
-    try {
-      // 1. Fetch plants
-      const plantList = await api.getPlants();
-      setPlants(plantList);
+// Primary bootstrapper fetching all live backend details
+const fetchAllData = async () => {
+  setLoading(true);
+  try {
+    // 1. Fetch plants
+    const plantList = await api.getPlants();
+    setPlants(plantList);
 
-      if (plantList.length > 0) {
-        if (!selectedConfigPlant) setSelectedConfigPlant(plantList[0]);
-        if (!adjPlant) setAdjPlant(plantList[0]);
-        if (!reportPlant) setReportPlant(plantList[0]);
-        
-        // Fetch budget details for each plant
-        const budgetsMap: Record<string, PlantBudgetResponse> = {};
-        for (const p of plantList) {
-          try {
-            const data = await api.getPlantBudget(p);
-            budgetsMap[p] = data;
-          } catch (budgetErr) {
-            console.error(`Error loading budget for plant ${p}:`, budgetErr);
-          }
+    if (plantList.length > 0) {
+      if (!selectedConfigPlant) setSelectedConfigPlant(plantList[0]);
+      if (!adjPlant) setAdjPlant(plantList[0]);
+      if (!reportPlant) setReportPlant(plantList[0]);
+      
+      // Fetch budget details for each plant
+      const budgetsMap: Record<string, PlantBudgetResponse> = {};
+      for (const p of plantList) {
+        try {
+          const data = await api.getPlantBudget(p);
+          budgetsMap[p] = data;
+        } catch (budgetErr) {
+          console.error(`Error loading budget for plant ${p}:`, budgetErr);
         }
-        setPlantDetailBudgets(budgetsMap);
       }
-
-      // 2. Fetch full config
-      const appConfig = await api.getConfig();
-      setConfig(appConfig);
-      setEditingConfigJson(JSON.stringify(appConfig, null, 2));
-
-      // 3. Fetch history
-      const savedInvoices = await api.getInvoices({ limit: 100 });
-      setInvoices(savedInvoices);
-
-      // 4. Fetch transactions log
-      const historyTransactions = await api.getTransactions({ limit: txLimit });
-      setTransactions(historyTransactions);
-
-    } catch (err: any) {
-      console.error(err);
-      showNotice(
-        `Connexion au serveur FastAPI impossible: ${err.message || err}. Assurez-vous que le serveur est démarré et renseignez l'Hôte correct dans la barre latérale.`, 
-        'err'
-      );
-    } finally {
-      setLoading(false);
+      setPlantDetailBudgets(budgetsMap);
     }
-  };
+
+    // 2. Fetch full config
+    const appConfig = await api.getConfig();
+    setConfig(appConfig);
+    setEditingConfigJson(JSON.stringify(appConfig, null, 2));
+
+    // 3. Fetch history
+    const savedInvoices = await api.getInvoices({ limit: 100 });
+    setInvoices(savedInvoices);
+
+    // ✅ AJOUT : Mettre à jour les dates du filtre avec la dernière facture
+    if (savedInvoices.length > 0) {
+      const lastInvoice = savedInvoices[0];
+      
+      // Utiliser la période de la facture si disponible
+      let startDate = lastInvoice.period_start;
+      let endDate = lastInvoice.period_end;
+      
+      // Si pas de période, essayer de la calculer depuis la date de facture
+      if (!startDate && lastInvoice.invoice_date) {
+        const parts = lastInvoice.invoice_date.split('/');
+        if (parts.length === 3) {
+          const day = parseInt(parts[0]);
+          const month = parseInt(parts[1]);
+          const year = parseInt(parts[2]);
+          
+          // La période est le mois précédent la date de facture
+          let periodMonth = month - 1;
+          let periodYear = year;
+          if (periodMonth === 0) {
+            periodMonth = 12;
+            periodYear = year - 1;
+          }
+          
+          // Premier jour du mois
+          startDate = `01/${periodMonth.toString().padStart(2, '0')}/${periodYear}`;
+          
+          // Dernier jour du mois
+          const lastDay = new Date(periodYear, periodMonth, 0).getDate();
+          endDate = `${lastDay.toString().padStart(2, '0')}/${periodMonth.toString().padStart(2, '0')}/${periodYear}`;
+        }
+      }
+      
+      // Appliquer les dates au filtre (convertir DD/MM/YYYY → YYYY-MM-DD pour input date)
+      if (startDate && endDate) {
+        const startParts = startDate.split('/');
+        const endParts = endDate.split('/');
+        if (startParts.length === 3 && endParts.length === 3) {
+          setReportStartDate(`${startParts[2]}-${startParts[1]}-${startParts[0]}`);
+          setReportEndDate(`${endParts[2]}-${endParts[1]}-${endParts[0]}`);
+          console.log(`📅 Filtre automatique: ${startDate} → ${endDate}`);
+        }
+      }
+    }
+
+    // 4. Fetch transactions log
+    const historyTransactions = await api.getTransactions({ limit: txLimit });
+    setTransactions(historyTransactions);
+
+  } catch (err: any) {
+    console.error(err);
+    showNotice(
+      `Connexion au serveur FastAPI impossible: ${err.message || err}. Assurez-vous que le serveur est démarré et renseignez l'Hôte correct dans la barre latérale.`, 
+      'err'
+    );
+  } finally {
+    setLoading(false);
+  }
+};
 
   useEffect(() => {
     fetchAllData();

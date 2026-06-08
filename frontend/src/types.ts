@@ -76,6 +76,8 @@ export interface InvoiceRecord {
   department: string;
   invoice_number: string;
   invoice_date: string;
+  period_start?: string;      // ← AJOUTER CETTE LIGNE
+  period_end?: string; 
   total: number;
   montant_ht?: number;
   montant_ttc?: number;

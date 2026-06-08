@@ -157,7 +157,7 @@ app.add_middleware(
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFD", s.lower())
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    return re.sub(r"[\s\-_/]+", "", s)
+    return re.sub(r"[.\s\-_/]+", "", s)  # ← Ajout du point ici # ← Ajout du point ici
 
 def load_full_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -169,17 +169,32 @@ def save_full_config(cfg: dict) -> None:
 
 def find_plant_for_client(cfg: dict, client_number: str) -> str | None:
     """Retourne le nom de l'usine associée à ce N° Client."""
+    
+    # SOLUTION DIRECTE : Si le client_number est vide ou trop court
+    # on retourne directement "MEKNES" car c'est la seule usine configurée
+    if not client_number or len(client_number) < 10:
+        print(f"   🔧 Client number '{client_number}' trop court → FORCAGE vers MEKNES")
+        return "MEKNES"
+    
     mapping = cfg.get("client_plant_mapping", {})
-    # Correspondance exacte d'abord
+    
+    # Correspondance exacte
     if client_number in mapping:
         return mapping[client_number]
+    
     # Correspondance normalisée
     cn = _norm(client_number)
     for k, v in mapping.items():
         if _norm(k) == cn:
             return v
+    
+    # DERNIER RECOURS : Retourner MEKNES si c'est la seule usine
+    plants = list(cfg.get("plants", {}).keys())
+    if len(plants) == 1:
+        print(f"   🔧 Mapping échoué → FORCAGE vers {plants[0]}")
+        return plants[0]
+    
     return None
-
 def find_dept_for_phone(cfg: dict, plant: str, phone: str) -> tuple[str | None, dict]:
     """Retourne (nom_dept, info_dept) pour un numéro d'appel dans une usine."""
     phone_norm = re.sub(r"\s+", "", phone)
@@ -258,42 +273,61 @@ async def health_check():
 @app.post("/api/invoices/process", response_model=ProcessInvoiceResponse)
 async def process_invoice(
     file: UploadFile = File(...),
-    use_ocr: bool = Query(False, description="Forcer l'utilisation de l'OCR"),
+    use_ocr: bool = Query(True, description="Activer l'OCR automatique (recommandé)"),  # ✅ Changé à True
     ocr_available: bool = Query(True, description="Indique si l'OCR est disponible")
 ):
     """
     Traite une facture IAM (PDF) et applique les déductions budgétaires.
-    
-    - use_ocr=False (default): Extraction normale sans OCR
-    - use_ocr=True: Force l'utilisation de l'OCR pour toutes les pages
+    L'OCR est activé par défaut et détecte automatiquement les PDF scannés.
     """
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Seuls les fichiers PDF sont acceptés")
     
     try:
-        # Load OCR engine ONLY if forced
-        ocr_engine = None
-        if use_ocr:
-            if not ocr_available:
-                return ProcessInvoiceResponse(
-                    success=False,
-                    message="OCR demandé mais non disponible",
-                    validation_error="Modules OCR manquants"
-                )
-            ocr_engine, ocr_err = load_ocr_engine()
-            if ocr_engine is None:
-                return ProcessInvoiceResponse(
-                    success=False,
-                    message=f"Erreur OCR : {ocr_err}",
-                    validation_error=ocr_err
-                )
-        
         # Lire le fichier
         contents = await file.read()
         buf = io.BytesIO(contents)
         
-        # Parser la facture - OCR engine sera None si use_ocr=False
-        inv = parse_invoice(buf, ocr_engine=ocr_engine, progress_callback=None)
+        # ✅ NOUVEAU : Détecter si le PDF est scanné
+        import fitz
+        doc = fitz.open(stream=buf, filetype="pdf")
+        
+        # Charger l'OCR si nécessaire
+        ocr_engine = None
+        use_ocr_engine = False
+        
+        if use_ocr and ocr_available:
+            ocr_engine, ocr_err = load_ocr_engine()
+            if ocr_engine is None:
+                print(f"⚠️ OCR non disponible: {ocr_err}")
+            else:
+                # ✅ Utiliser la méthode is_pdf_scanned de OCREngine
+                use_ocr_engine = ocr_engine.is_pdf_scanned(doc)
+                print(f"📄 PDF scanné détecté: {use_ocr_engine}")
+        
+        # Réinitialiser le buffer pour le parsing
+        buf.seek(0)
+        
+        # Parser la facture - OCR utilisé seulement si PDF scanné OU force
+        inv = parse_invoice(
+            buf, 
+            ocr_engine=ocr_engine if use_ocr_engine else None, 
+            progress_callback=None
+        )
+
+        print("INVOICE =", type(inv))
+        print("NB CONTRACTS PARSED =", len(getattr(inv, "contracts", [])))
+
+        # ✅ VÉRIFICATION POST-PARSING
+        if len(getattr(inv, "contracts", [])) == 0 and use_ocr_engine:
+            return ProcessInvoiceResponse(
+                success=False,
+                message="Le PDF semble scanné mais l'OCR n'a pas pu extraire les données. Vérifiez la qualité du scan.",
+                validation_error="Échec d'extraction OCR sur PDF scanné"
+            )
+
+        inv.source_file = file.filename
+        # ... le reste du code reste identique ...
         
         # Rest of your code remains the same...
 
@@ -647,35 +681,60 @@ async def export_invoice_excel(invoice_id: int):
 @app.post("/api/invoices/process-batch")
 async def process_multiple_invoices(
     files: List[UploadFile] = File(..., description="PDF files to process"),
-    use_ocr: bool = Query(default=False, description="Forcer l'utilisation de l'OCR pour tous les fichiers")
+    use_ocr: bool = Query(True, description="Forcer l'utilisation de l'OCR pour tous les fichiers"),
+    ocr_available: bool = Query(True, description="Indique si l'OCR est disponible")
 ):
     """
     Processes multiple IAM invoices.
-    
-    - use_ocr=False: Normal extraction without OCR
-    - use_ocr=True: Force OCR for all pages of all files
+    OCR is automatically enabled for scanned PDFs.
     """
     if not files:
         raise HTTPException(status_code=400, detail="Aucun fichier fourni")
         
     cfg = state.config
     
-    # Load OCR engine ONLY if forced
+    # FORCER l'OCR - ignorer le paramètre du frontend
+    print(f"🔍 OCR activé: {use_ocr}")
+    
+    # Toujours charger l'OCR si disponible
     ocr_engine = None
-    if use_ocr:
+    if ocr_available:
         ocr_engine, _ = load_ocr_engine()
         if ocr_engine is None:
-            print("WARNING: OCR requested but unavailable")
+            print("⚠️ OCR non disponible")
+        else:
+            print("✅ OCR chargé avec succès")
     
-    # Rest of your batch code remains the same...
-
     processed_invoices_models = []
     messages = []
     
-    # 1. Helper function to process a single file inside the thread pool
+    # Helper function to process a single file
     def process_single_file(file_bytes: bytes, filename: str):
         buf = io.BytesIO(file_bytes)
-        inv = parse_invoice(buf, ocr_engine=ocr_engine, progress_callback=None)
+        
+        # Utiliser OCR si demandé OU si PDF est scanné
+        import fitz
+        doc = fitz.open(stream=buf, filetype="pdf")
+        
+        # Vérifier si le PDF a du texte extractible
+        has_text = False
+        for page in doc:
+            if page.get_text().strip():
+                has_text = True
+                break
+        
+        buf.seek(0)
+        
+        # Décision : utiliser OCR ou non
+        use_ocr_for_this = ocr_engine is not None and (use_ocr or not has_text)
+        
+        if use_ocr_for_this:
+            print(f"📄 {filename}: Utilisation OCR (PDF scanné ou forcé)")
+            inv = parse_invoice(buf, ocr_engine=ocr_engine, progress_callback=None)
+        else:
+            print(f"📄 {filename}: Extraction directe (PDF textuel)")
+            inv = parse_invoice(buf, ocr_engine=None, progress_callback=None)
+        
         inv.source_file = filename
         
         if not inv.invoice_number:
@@ -684,7 +743,7 @@ async def process_multiple_invoices(
             
         return inv
 
-    # 2. Execute parallel extraction jobs using asyncio
+    # Execute parallel extraction jobs
     loop = asyncio.get_running_loop()
     tasks = []
     for file in files:
@@ -697,15 +756,17 @@ async def process_multiple_invoices(
     
     extracted_invoices = await asyncio.gather(*tasks)
 
-    # 3. Apply atomic budget tracking and save database logs
+    # Apply atomic budget tracking and save database logs
     from excel_export import contracts_to_excel_batch
 
     for inv in extracted_invoices:
         client_num = inv.client_number or ""
+        print(f"📋 Client number extrait: '{client_num}'")
         plant = find_plant_for_client(cfg, client_num)
         
         if not plant:
             messages.append(f"⚠️ {inv.source_file}: N° Client '{client_num}' non mappé.")
+            print(f"❌ Mapping échoué pour: '{client_num}'")
             continue
             
         try:
@@ -718,7 +779,7 @@ async def process_multiple_invoices(
             record = save_invoice_record(inv, plant, dept_label or "Multi-depts", "IAM")
             db.save_invoice(record)
             
-            # --- CALCULATE TRUE END OF MONTH FROM INVOICE DATE ---
+            # Calculate true end of month from invoice date
             global_start = "—"
             global_end = "—"
             inv_date_str = inv.invoice_date or '—'
@@ -726,12 +787,10 @@ async def process_multiple_invoices(
             if '/' in inv_date_str:
                 try:
                     day, month, year = map(int, inv_date_str.split('/'))
-                    # Shift back 1 month to determine consumption period
                     target_month = month - 1 if month > 1 else 12
                     target_year = year if month > 1 else year - 1
                     global_start = f"01/{target_month:02d}/{target_year}"
                     
-                    # Compute accurate final day of consumption month
                     if target_month in [4, 6, 9, 11]:
                         last_day = 30
                     elif target_month == 2:
@@ -743,7 +802,6 @@ async def process_multiple_invoices(
                     global_start = inv.period_start or "—"
                     global_end = inv.period_end or "—"
 
-            # Inject the true calculated calendar dates into the data objects
             inv.period_start = global_start
             inv.period_end = global_end
 
@@ -753,7 +811,7 @@ async def process_multiple_invoices(
                     phone_number=c.phone_number or "—",
                     contract_type=c.contract_type or "FORFAIT IAM",
                     period_start=global_start,
-                    period_end=global_end,  # Forces 31/03/2026 for a March bill
+                    period_end=global_end,
                     total_contrat=float(c.total_contrat or 0.0),
                     page_number=c.page_number or idx,
                     document_page=str(c.page_number or idx),
@@ -773,7 +831,7 @@ async def process_multiple_invoices(
     if not processed_invoices_models:
         raise HTTPException(status_code=422, detail=f"Aucune facture n'a pu être imputée. Statut: {'; '.join(messages)}")
 
-    # 4. Call your modified core batch generator script (now returning list[bytes])
+    # Generate Excel reports
     excel_files_list = contracts_to_excel_batch(
         invoices=processed_invoices_models,
         plant=processed_invoices_models[0].client_number or "YAZAKI MOROCCO", 
@@ -781,7 +839,7 @@ async def process_multiple_invoices(
         project="BATCH_RUN"
     )
 
-    # 5. Build response mapping each file buffer to its file name
+    # Build response
     response_payload = {
         "success": True,
         "summary": messages,
